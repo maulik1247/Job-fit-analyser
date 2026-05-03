@@ -1,9 +1,16 @@
-import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/** Lazy-load native module so `/api/analyse` works even if SQLite fails to load (e.g. some serverless). */
+function SqliteDatabase() {
+  return require("better-sqlite3");
+}
 
 /** On Vercel, only /tmp is writable; DB is ephemeral across cold starts. */
 const dbPath =
@@ -32,6 +39,7 @@ function migrateIfNeeded(database) {
 
 export function getDb() {
   if (!db) {
+    const Database = SqliteDatabase();
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     db = new Database(dbPath);
     db.pragma("foreign_keys = ON");

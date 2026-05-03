@@ -112,10 +112,16 @@ function JDAnalyserApp() {
         return;
       }
 
-      const data = await res.json().catch(() => ({}));
+      const responseText = await res.text();
+      let data = {};
+      try {
+        data = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        console.error("Non-JSON response:", responseText?.slice(0, 500));
+      }
 
       if (!res.ok) {
-        console.error("Analyse API error:", data);
+        console.error("Analyse API error:", res.status, data);
         if (res.status === 401) {
           setError("Session expired. Please sign in again.");
           return;
@@ -138,8 +144,12 @@ function JDAnalyserApp() {
           );
         } else if (serverMsg) {
           setError(serverMsg);
+        } else if (responseText && responseText.length < 400) {
+          setError(`Server error (${res.status}): ${responseText}`);
         } else {
-          setError(GENERIC_ERROR);
+          setError(
+            `Server error (${res.status}). If deployed on Vercel, check Functions logs and env vars (OPENAI_API_KEY, CLERK_SECRET_KEY).`
+          );
         }
         return;
       }
@@ -147,7 +157,12 @@ function JDAnalyserApp() {
       const raw = data?.choices?.[0]?.message?.content;
       if (typeof raw !== "string") {
         console.error("Unexpected response shape:", data);
-        setError(GENERIC_ERROR);
+        const refusal = data?.choices?.[0]?.finish_reason;
+        setError(
+          refusal === "content_filter"
+            ? "OpenAI blocked this content. Try a shorter or different JD."
+            : "No text in the model response. Check Vercel logs or try again."
+        );
         return;
       }
 

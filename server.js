@@ -13,8 +13,6 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-getDb();
-
 const SYSTEM_PROMPT =
   "You are an expert recruiter and career coach. Analyse ONLY the job description provided (no candidate profile). Return ONLY a valid JSON object with exactly these keys:\n" +
   "- matchScore: number 0-100 scoring overall JD quality and clarity as a hiring brief\n" +
@@ -55,8 +53,18 @@ const PLACEHOLDER_KEYS = new Set([
 ]);
 
 app.get("/api/history", requireClerkAuth, (req, res) => {
-  const entries = listHistoryForUser(req.clerkUserId);
-  res.json({ entries });
+  try {
+    getDb();
+    const entries = listHistoryForUser(req.clerkUserId);
+    res.json({ entries });
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({
+      error:
+        "History database is unavailable on this deployment. Analysis still works.",
+      code: "DB_UNAVAILABLE",
+    });
+  }
 });
 
 app.post("/api/history", requireClerkAuth, (req, res) => {
@@ -77,6 +85,7 @@ app.post("/api/history", requireClerkAuth, (req, res) => {
     return res.status(400).json({ error: "Invalid history entry" });
   }
   try {
+    getDb();
     insertHistoryEntry(req.clerkUserId, {
       id,
       companyName,
@@ -87,19 +96,34 @@ app.post("/api/history", requireClerkAuth, (req, res) => {
     res.status(201).json({ ok: true });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Could not save history" });
+    res.status(503).json({
+      error: "Could not save history (database unavailable).",
+      code: "DB_UNAVAILABLE",
+    });
   }
 });
 
 app.delete("/api/history", requireClerkAuth, (req, res) => {
-  clearHistoryForUser(req.clerkUserId);
-  res.json({ ok: true });
+  try {
+    getDb();
+    clearHistoryForUser(req.clerkUserId);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({ error: "Database unavailable", code: "DB_UNAVAILABLE" });
+  }
 });
 
 app.delete("/api/history/:id", requireClerkAuth, (req, res) => {
-  const ok = deleteHistoryEntry(req.clerkUserId, req.params.id);
-  if (!ok) return res.status(404).json({ error: "Not found" });
-  res.json({ ok: true });
+  try {
+    getDb();
+    const ok = deleteHistoryEntry(req.clerkUserId, req.params.id);
+    if (!ok) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({ error: "Database unavailable", code: "DB_UNAVAILABLE" });
+  }
 });
 
 app.post("/api/analyse", requireClerkAuth, async (req, res) => {
