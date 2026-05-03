@@ -1,5 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/**/*.js": {
+      "includeFiles": "node_modules/pdfjs-dist/**"
+    }
+  },
   "rewrites": [
     {
       "source": "/api",

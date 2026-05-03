@@ -1,13 +1,23 @@
 import path from "node:path";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import mammoth from "mammoth";
-import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+import {
+  getDocument,
+  GlobalWorkerOptions,
+} from "pdfjs-dist/legacy/build/pdf.mjs";
 
 const require = createRequire(import.meta.url);
 
 function pdfjsDistRoot() {
   return path.dirname(require.resolve("pdfjs-dist/package.json"));
 }
+
+/** Absolute file URL so pdf.js can load `pdf.worker.mjs` (required on Vercel where cwd-relative imports fail). */
+const pdfWorkerSrc = pathToFileURL(
+  path.join(pdfjsDistRoot(), "legacy/build/pdf.worker.mjs")
+).href;
+GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
 
 /** Trailing path.sep — pdf.js concatenates baseUrl + filename for fs reads in Node */
 function pdfAssetBaseDirs() {
