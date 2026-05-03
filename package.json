@@ -10,8 +10,8 @@
     "start": "NODE_ENV=production node server.js"
   },
   "dependencies": {
+    "@clerk/backend": "^3.4.4",
     "@clerk/clerk-react": "^5.61.6",
-    "@clerk/express": "^2.1.12",
     "better-sqlite3": "^12.9.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",

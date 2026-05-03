@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { clerkMiddleware, getAuth } from "@clerk/express";
+import { verifyToken } from "@clerk/backend";
 import {
   getDb,
   insertHistoryEntry,
@@ -34,15 +34,43 @@ const app = express();
 if (isProd) app.set("trust proxy", 1);
 
 app.use(express.json({ limit: "512kb" }));
-app.use(clerkMiddleware());
 
+/**
+ * Bearer JWT only — matches the SPA (`Authorization: Bearer` from Clerk `getToken()`).
+ * We avoid `@clerk/express` middleware here: its auth step is async, and Express 4 does not
+ * wait on async middleware, so `getAuth()` could run too early and throw (500 HTML on Vercel).
+ */
 function requireClerkAuth(req, res, next) {
-  const { userId } = getAuth(req);
-  if (!userId) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  req.clerkUserId = userId;
-  next();
+  void (async () => {
+    const raw = req.headers.authorization;
+    const token =
+      typeof raw === "string" && raw.startsWith("Bearer ")
+        ? raw.slice(7).trim()
+        : null;
+    if (!token) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    const secretKey = process.env.CLERK_SECRET_KEY?.trim();
+    if (!secretKey) {
+      console.error("CLERK_SECRET_KEY is not set");
+      res.status(500).json({ error: "Server misconfiguration" });
+      return;
+    }
+    try {
+      const payload = await verifyToken(token, { secretKey });
+      const userId = payload.sub;
+      if (!userId) {
+        res.status(401).json({ error: "Unauthorized" });
+        return;
+      }
+      req.clerkUserId = userId;
+      next();
+    } catch (e) {
+      console.error("Clerk verifyToken:", e?.message || e);
+      res.status(401).json({ error: "Unauthorized" });
+    }
+  })().catch((e) => next(e));
 }
 
 const PLACEHOLDER_KEYS = new Set([
@@ -176,6 +204,17 @@ app.post("/api/analyse", requireClerkAuth, async (req, res) => {
     console.error(err);
     return res.status(500).json({ error: "Server error calling OpenAI" });
   }
+});
+
+app.use((err, req, res, next) => {
+  console.error(err);
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  res.status(500).json({
+    error: err?.message || "Internal server error",
+  });
 });
 
 /* Vercel serves `dist/` via CDN; only this Node serverless fn handles /api. */
