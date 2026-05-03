@@ -154,7 +154,8 @@ app.post("/api/analyse", requireClerkAuth, async (req, res) => {
   }
 });
 
-if (isProd) {
+/* Vercel serves `dist/` via CDN; only this Node serverless fn handles /api. */
+if (isProd && !process.env.VERCEL) {
   const dist = path.join(__dirname, "dist");
   app.use(express.static(dist));
   app.get("*", (req, res) => {
@@ -162,8 +163,12 @@ if (isProd) {
   });
 }
 
-app.listen(PORT, () => {
-  console.log(
-    `Server http://localhost:${PORT} (${isProd ? "production + static" : "API only — use Vite dev with proxy"})`
-  );
-});
+export default app;
+
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(
+      `Server http://localhost:${PORT} (${isProd ? "production + static" : "API only — use Vite dev with proxy"})`
+    );
+  });
+}

@@ -5,8 +5,12 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/** On Vercel, only /tmp is writable; DB is ephemeral across cold starts. */
 const dbPath =
-  process.env.DATABASE_PATH || path.join(__dirname, "data", "app.db");
+  process.env.DATABASE_PATH?.trim() ||
+  (process.env.VERCEL
+    ? "/tmp/jd-analyser.db"
+    : path.join(__dirname, "data", "app.db"));
 
 let db;
 
