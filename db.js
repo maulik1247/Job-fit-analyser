@@ -54,6 +54,17 @@ function migrateHistoryResumeColumns(database) {
   }
 }
 
+function migrateHistoryJobMeta(database) {
+  if (!columnExists(database, "history_entries", "job_url")) {
+    database.exec("ALTER TABLE history_entries ADD COLUMN job_url TEXT");
+  }
+  if (!columnExists(database, "history_entries", "applied")) {
+    database.exec(
+      "ALTER TABLE history_entries ADD COLUMN applied INTEGER NOT NULL DEFAULT 0"
+    );
+  }
+}
+
 export function getDb() {
   if (!db) {
     const Database = SqliteDatabase();
@@ -84,6 +95,7 @@ export function getDb() {
       CREATE INDEX IF NOT EXISTS idx_resumes_clerk ON resumes(clerk_user_id, updated_at DESC);
     `);
     migrateHistoryResumeColumns(db);
+    migrateHistoryJobMeta(db);
   }
   return db;
 }
@@ -95,8 +107,8 @@ export function insertHistoryEntry(clerkUserId, entry) {
   const tx = database.transaction(() => {
     database
       .prepare(
-        `INSERT INTO history_entries (id, clerk_user_id, company_name, jd_text, result_json, created_at, resume_id, resume_title, resume_body)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO history_entries (id, clerk_user_id, company_name, jd_text, result_json, created_at, resume_id, resume_title, resume_body, job_url, applied)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         entry.id,
@@ -107,7 +119,9 @@ export function insertHistoryEntry(clerkUserId, entry) {
         entry.createdAt,
         entry.resumeId ?? null,
         entry.resumeTitle ?? null,
-        entry.resumeBody ?? null
+        entry.resumeBody ?? null,
+        entry.jobUrl ?? null,
+        entry.applied ? 1 : 0
       );
     const count = database
       .prepare(
@@ -131,7 +145,8 @@ export function listHistoryForUser(clerkUserId) {
   const rows = getDb()
     .prepare(
       `SELECT id, company_name as companyName, jd_text as jdText, result_json as resultJson, created_at as createdAt,
-              resume_id as resumeId, resume_title as resumeTitle, resume_body as resumeBody
+              resume_id as resumeId, resume_title as resumeTitle, resume_body as resumeBody,
+              job_url as jobUrl, applied
        FROM history_entries WHERE clerk_user_id = ? ORDER BY created_at DESC`
     )
     .all(clerkUserId);
@@ -144,7 +159,45 @@ export function listHistoryForUser(clerkUserId) {
     resumeId: row.resumeId,
     resumeTitle: row.resumeTitle,
     resumeBody: row.resumeBody,
+    jobUrl: row.jobUrl,
+    applied: Boolean(row.applied),
   }));
+}
+
+/**
+ * @param {string} clerkUserId
+ * @param {string} id
+ * @param {{ jobUrl?: string | null, applied?: boolean }} patch — only keys present are updated. Empty jobUrl → null.
+ */
+export function updateHistoryEntryMeta(clerkUserId, id, patch) {
+  const database = getDb();
+  const row = database
+    .prepare(
+      "SELECT id FROM history_entries WHERE id = ? AND clerk_user_id = ?"
+    )
+    .get(id, clerkUserId);
+  if (!row) return false;
+  const sets = [];
+  const vals = [];
+  if ("jobUrl" in patch) {
+    sets.push("job_url = ?");
+    const v = patch.jobUrl;
+    const trimmed =
+      typeof v === "string" && v.trim() ? v.trim().slice(0, 4000) : null;
+    vals.push(trimmed);
+  }
+  if ("applied" in patch) {
+    sets.push("applied = ?");
+    vals.push(patch.applied ? 1 : 0);
+  }
+  if (sets.length === 0) return true;
+  vals.push(id, clerkUserId);
+  database
+    .prepare(
+      `UPDATE history_entries SET ${sets.join(", ")} WHERE id = ? AND clerk_user_id = ?`
+    )
+    .run(...vals);
+  return true;
 }
 
 const MAX_RESUMES = 30;

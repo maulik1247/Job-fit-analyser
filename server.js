@@ -16,8 +16,10 @@ import {
   insertResume,
   updateResume,
   deleteResume,
+  updateHistoryEntryMeta,
 } from "./db.js";
 import { extractResumeText } from "./resumeParse.js";
+import { normaliseAnalysisPayload } from "./analysisNormalize.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -29,6 +31,8 @@ const SYSTEM_PROMPT =
   "- keywordsMissing: array of strings — important JD requirements that the resume does not show or only weakly suggests\n" +
   "- strengths: array of exactly 3 strings — the candidate’s strongest points for this role based on the resume\n" +
   "- gaps: array of exactly 3 strings — main gaps or risks (resume vs what the JD needs)\n" +
+  "- shortlistRisks: array of exactly 3 strings — why a busy recruiter might NOT shortlist this resume (first impression, weak hook, dense or vague bullets, formatting/ATS risk, tenure or scope signals, credibility gaps). Do not repeat gaps verbatim; focus on screening psychology and presentation, not a bare list of missing keywords.\n" +
+  "- positioningTips: array of exactly 3 strings — concrete ways to improve how the candidate is positioned for this role: narrative, headline/summary, impact framing, leadership story, reordering emphasis, metrics, or LinkedIn alignment. Each tip must be strategic or structural, not “add keyword X”.\n" +
   "Return nothing else. No markdown, no code fences, no explanation. Pure JSON only.";
 
 const PORT = Number(process.env.PORT) || 8787;
@@ -193,7 +197,10 @@ app.post(
 app.get("/api/history", requireClerkAuth, (req, res) => {
   try {
     getDb();
-    const entries = listHistoryForUser(req.clerkUserId);
+    const entries = listHistoryForUser(req.clerkUserId).map((e) => {
+      const n = normaliseAnalysisPayload(e.result);
+      return n ? { ...e, result: n } : e;
+    });
     res.json({ entries });
   } catch (e) {
     console.error(e);
@@ -215,6 +222,8 @@ app.post("/api/history", requireClerkAuth, (req, res) => {
   const resumeId = body.resumeId;
   const resumeTitle = body.resumeTitle;
   const resumeBody = body.resumeBody;
+  const jobUrlRaw = body.jobUrl;
+  const appliedRaw = body.applied;
   if (
     typeof id !== "string" ||
     typeof companyName !== "string" ||
@@ -234,23 +243,72 @@ app.post("/api/history", requireClerkAuth, (req, res) => {
   if (resumeBody != null && typeof resumeBody !== "string") {
     return res.status(400).json({ error: "Invalid history entry" });
   }
+  if (jobUrlRaw != null && typeof jobUrlRaw !== "string") {
+    return res.status(400).json({ error: "Invalid history entry" });
+  }
+  if (appliedRaw != null && typeof appliedRaw !== "boolean") {
+    return res.status(400).json({ error: "Invalid history entry" });
+  }
+  const jobUrl =
+    typeof jobUrlRaw === "string" && jobUrlRaw.trim()
+      ? jobUrlRaw.trim().slice(0, 4000)
+      : null;
+  const applied = appliedRaw === true;
+  const resultToStore = normaliseAnalysisPayload(result) ?? result;
   try {
     getDb();
     insertHistoryEntry(req.clerkUserId, {
       id,
       companyName,
       jdText,
-      result,
+      result: resultToStore,
       createdAt,
       resumeId: resumeId ?? null,
       resumeTitle: resumeTitle ?? null,
       resumeBody: resumeBody ?? null,
+      jobUrl,
+      applied,
     });
     res.status(201).json({ ok: true });
   } catch (e) {
     console.error(e);
     res.status(503).json({
       error: "Could not save history (database unavailable).",
+      code: "DB_UNAVAILABLE",
+    });
+  }
+});
+
+app.patch("/api/history/:id", requireClerkAuth, (req, res) => {
+  const body = req.body ?? {};
+  const hasJobUrl = Object.prototype.hasOwnProperty.call(body, "jobUrl");
+  const hasApplied = Object.prototype.hasOwnProperty.call(body, "applied");
+  if (!hasJobUrl && !hasApplied) {
+    return res.status(400).json({ error: "Provide jobUrl and/or applied" });
+  }
+  if (hasJobUrl && body.jobUrl != null && typeof body.jobUrl !== "string") {
+    return res.status(400).json({ error: "Invalid jobUrl" });
+  }
+  if (hasApplied && typeof body.applied !== "boolean") {
+    return res.status(400).json({ error: "Invalid applied" });
+  }
+  const patch = {};
+  if (hasJobUrl) {
+    const t = typeof body.jobUrl === "string" ? body.jobUrl.trim() : "";
+    patch.jobUrl = t ? t.slice(0, 4000) : null;
+  }
+  if (hasApplied) {
+    patch.applied = body.applied === true;
+  }
+  try {
+    getDb();
+    const ok = updateHistoryEntryMeta(req.clerkUserId, req.params.id, patch);
+    if (!ok) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({
+      error: "Could not update history (database unavailable).",
       code: "DB_UNAVAILABLE",
     });
   }
@@ -423,6 +481,30 @@ app.post("/api/analyse", requireClerkAuth, async (req, res) => {
         details: data,
       });
     }
+
+    const choice0 = data?.choices?.[0];
+    const content = choice0?.message?.content;
+    if (!choice0?.message || typeof content !== "string" || !content.trim()) {
+      return res.status(502).json({
+        error: "No text in the model response",
+        details: data,
+      });
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(content.replace(/```json|```/g, "").trim());
+    } catch (e) {
+      console.error("Analyse JSON parse:", e);
+      return res.status(502).json({
+        error: "Model did not return valid JSON",
+        details: String(e?.message || e),
+      });
+    }
+    const normalised = normaliseAnalysisPayload(parsed);
+    if (!normalised) {
+      return res.status(502).json({ error: "Invalid analysis payload shape" });
+    }
+    choice0.message.content = JSON.stringify(normalised);
 
     return res.json(data);
   } catch (err) {

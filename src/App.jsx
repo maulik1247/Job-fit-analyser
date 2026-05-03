@@ -19,6 +19,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./components/ui/select.jsx";
+import { shapeAnalysisForClient } from "../analysisNormalize.js";
 
 const RESUME_SELECT_NONE = "__shadcn_resume_none__";
 
@@ -30,6 +31,17 @@ const VALIDATION_RESUME =
   "Select a saved resume. Add one under My resumes in the sidebar if needed.";
 const VALIDATION_NO_RESUMES =
   "Add at least one resume from the sidebar: My resumes → + Add.";
+
+/** Safe href for opening a pasted job URL (adds https if missing). */
+function jobPostingHref(raw) {
+  const t = (raw || "").trim();
+  if (!t) return null;
+  try {
+    return new URL(t.includes("://") ? t : `https://${t}`).href;
+  } catch {
+    return null;
+  }
+}
 
 function Spinner() {
   return (
@@ -68,6 +80,8 @@ function JDAnalyserApp() {
   const menuInitial = "M";
 
   const [companyName, setCompanyName] = useState("");
+  const [jobUrl, setJobUrl] = useState("");
+  const [applied, setApplied] = useState(false);
   const [jdText, setJdText] = useState("");
   const [resumeText, setResumeText] = useState("");
   const [resumes, setResumes] = useState([]);
@@ -90,6 +104,7 @@ function JDAnalyserApp() {
   const [highlightJd, setHighlightJd] = useState(false);
   const [highlightResume, setHighlightResume] = useState(false);
   const [validationMessage, setValidationMessage] = useState(null);
+  const [savingJobMeta, setSavingJobMeta] = useState(false);
 
   const loadResumes = useCallback(async () => {
     const r = await apiFetch("/api/resumes");
@@ -109,6 +124,16 @@ function JDAnalyserApp() {
     loadHistory().catch(console.error);
     loadResumes().catch(console.error);
   }, [loadHistory, loadResumes]);
+
+  /** Keep `result` aligned with history + same shape as server (recruiter arrays backfilled). */
+  useEffect(() => {
+    if (!activeEntryId) return;
+    const h = history.find((e) => e.id === activeEntryId);
+    const shaped = shapeAnalysisForClient(h?.result);
+    if (shaped && typeof shaped === "object" && !Array.isArray(shaped)) {
+      setResult(shaped);
+    }
+  }, [history, activeEntryId]);
 
   const closeResumeModal = useCallback(() => {
     setResumeModalOpen(false);
@@ -173,6 +198,8 @@ function JDAnalyserApp() {
 
   const startNewAnalysis = () => {
     setCompanyName("");
+    setJobUrl("");
+    setApplied(false);
     setJdText("");
     setResumeText("");
     setSelectedResumeId(null);
@@ -296,7 +323,20 @@ function JDAnalyserApp() {
         return;
       }
 
-      setResult(parsed);
+      const shaped =
+        shapeAnalysisForClient(parsed) ??
+        (parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? parsed
+          : null);
+      if (!shaped || typeof shaped !== "object" || Array.isArray(shaped)) {
+        setError(
+          "Could not read the model response. Try again or check the server terminal."
+        );
+        return;
+      }
+      setResult(shaped);
+      setJobUrl("");
+      setApplied(false);
 
       const resumeTitleForHistory = picked?.title ?? "Resume";
 
@@ -304,11 +344,13 @@ function JDAnalyserApp() {
         id: crypto.randomUUID(),
         companyName: companyName.trim() || "Untitled company",
         jdText,
-        result: parsed,
+        result: shaped,
         createdAt: new Date().toISOString(),
         resumeId: selectedResumeId ?? null,
         resumeTitle: resumeTitleForHistory,
         resumeBody: resumeBody,
+        jobUrl: null,
+        applied: false,
       };
       setActiveEntryId(entry.id);
       const saveRes = await apiFetch("/api/history", {
@@ -328,6 +370,8 @@ function JDAnalyserApp() {
 
   const openHistoryEntry = (entry) => {
     setCompanyName(entry.companyName === "Untitled company" ? "" : entry.companyName);
+    setJobUrl(typeof entry.jobUrl === "string" ? entry.jobUrl : "");
+    setApplied(Boolean(entry.applied));
     setJdText(entry.jdText);
     setResumeText(entry.resumeBody ?? "");
     setSelectedResumeId(
@@ -336,7 +380,14 @@ function JDAnalyserApp() {
         ? entry.resumeId
         : null
     );
-    setResult(entry.result);
+    const shaped =
+      shapeAnalysisForClient(entry.result) ??
+      (entry.result &&
+      typeof entry.result === "object" &&
+      !Array.isArray(entry.result)
+        ? entry.result
+        : null);
+    setResult(shaped);
     setActiveEntryId(entry.id);
     setError(null);
     setValidationMessage(null);
@@ -421,6 +472,29 @@ function JDAnalyserApp() {
       setActiveEntryId(null);
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const saveJobMeta = async () => {
+    if (!activeEntryId) return;
+    setSavingJobMeta(true);
+    try {
+      const r = await apiFetch(
+        `/api/history/${encodeURIComponent(activeEntryId)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            jobUrl: jobUrl.trim() ? jobUrl.trim() : null,
+            applied,
+          }),
+        }
+      );
+      if (!r.ok) return;
+      await loadHistory();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setSavingJobMeta(false);
     }
   };
 
@@ -639,11 +713,18 @@ function JDAnalyserApp() {
                           <span className="block truncate font-medium">
                             {entry.companyName}
                           </span>
-                          <span className="mt-0.5 block truncate text-xs text-zinc-500">
-                            {entry.resumeTitle
-                              ? `${entry.resumeTitle} · `
-                              : ""}
-                            {score}/100
+                          <span className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-zinc-500">
+                            <span className="truncate">
+                              {entry.resumeTitle
+                                ? `${entry.resumeTitle} · `
+                                : ""}
+                              {score}/100
+                            </span>
+                            {entry.applied && (
+                              <span className="shrink-0 rounded bg-emerald-950/80 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
+                                Applied
+                              </span>
+                            )}
                           </span>
                         </span>
                       </button>
@@ -815,16 +896,6 @@ function JDAnalyserApp() {
                   <span className="text-zinc-400">My resumes → + Add</span>.
                   Then pick it here to compare with the job description.
                 </p>
-                {selectedResumeId &&
-                  resumeText.trim() &&
-                  resumes.some((x) => x.id === selectedResumeId) && (
-                    <p className="text-xs text-emerald-400/90">
-                      {
-                        resumes.find((x) => x.id === selectedResumeId)?.title
-                      }{" "}
-                      · {resumeText.length.toLocaleString()} characters
-                    </p>
-                  )}
               </div>
 
               <div className="flex flex-col gap-2">
@@ -901,9 +972,6 @@ function JDAnalyserApp() {
                     <p className="mt-1 text-sm text-zinc-400">
                       {resumeLabelForView}
                     </p>
-                    <div className="mt-2 max-h-48 w-full overflow-y-auto rounded-lg border border-zinc-700/80 bg-zinc-950/60 px-3 py-3 text-xs leading-relaxed text-zinc-400 whitespace-pre-wrap">
-                      {resumeText || "(No resume text saved with this run)"}
-                    </div>
                   </div>
                   <div>
                     <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">
@@ -917,11 +985,15 @@ function JDAnalyserApp() {
               </section>
 
               <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
-                <h2 className="mb-4 text-lg font-semibold text-white">
-                  Resume ↔ job fit
+                <h2 className="text-lg font-semibold text-white">
+                  Analyse fit
                 </h2>
+                <p className="mt-1 text-sm text-zinc-500">
+                  Fit score plus recruiter-style read: shortlist risks and how to
+                  position yourself—not just keywords.
+                </p>
                 <div
-                  className={`mx-auto flex max-w-xs flex-col items-center justify-center rounded-2xl border px-8 py-10 ${scoreBg}`}
+                  className={`mx-auto mt-6 flex max-w-xs flex-col items-center justify-center rounded-2xl border px-8 py-10 ${scoreBg}`}
                 >
                   <p className="mb-2 text-sm font-medium text-zinc-400">
                     Fit score
@@ -935,6 +1007,75 @@ function JDAnalyserApp() {
                     </span>
                   </p>
                 </div>
+
+                {(() => {
+                  const shortlistRisks = result.shortlistRisks || [];
+                  const positioningTips = result.positioningTips || [];
+                  const bothMissing =
+                    shortlistRisks.length === 0 && positioningTips.length === 0;
+
+                  return (
+                    <div className="mt-10 space-y-8 border-t border-zinc-800 pt-10">
+                      {bothMissing ? (
+                        <div className="rounded-lg border border-zinc-700 bg-zinc-950/50 p-4 text-sm text-zinc-500">
+                          <p className="font-medium text-zinc-400">
+                            Recruiter insights not in this saved run
+                          </p>
+                          <p className="mt-2 leading-relaxed">
+                            This history entry was saved before those fields
+                            existed. Use{" "}
+                            <span className="text-zinc-400">New analysis</span>{" "}
+                            and <span className="text-zinc-400">Analyse fit</span>{" "}
+                            to refresh—they will show here with the score.
+                          </p>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="rounded-lg border border-amber-900/40 bg-amber-950/20 p-5">
+                            <h3 className="text-base font-semibold text-amber-100">
+                              Why a recruiter might not shortlist you
+                            </h3>
+                            <p className="mt-1 text-xs text-amber-200/80">
+                              Screening and signal—not the same as missing
+                              keywords alone.
+                            </p>
+                            <ul className="mt-3 list-disc space-y-2 pl-5 text-sm text-amber-100/95">
+                              {shortlistRisks.length > 0 ? (
+                                shortlistRisks.map((t, i) => (
+                                  <li key={i}>{t}</li>
+                                ))
+                              ) : (
+                                <li className="text-amber-200/70">
+                                  Not returned for this run—try analysing again.
+                                </li>
+                              )}
+                            </ul>
+                          </div>
+                          <div className="rounded-lg border border-sky-900/40 bg-sky-950/20 p-5">
+                            <h3 className="text-base font-semibold text-sky-100">
+                              Improve your positioning
+                            </h3>
+                            <p className="mt-1 text-xs text-sky-200/80">
+                              Story, framing, and emphasis—not just keyword
+                              stuffing.
+                            </p>
+                            <ul className="mt-3 list-disc space-y-2 pl-5 text-sm text-sky-100/95">
+                              {positioningTips.length > 0 ? (
+                                positioningTips.map((t, i) => (
+                                  <li key={i}>{t}</li>
+                                ))
+                              ) : (
+                                <li className="text-sky-200/70">
+                                  Not returned for this run—try analysing again.
+                                </li>
+                              )}
+                            </ul>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
               </section>
 
               <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
@@ -992,6 +1133,84 @@ function JDAnalyserApp() {
                   </ul>
                 </section>
               </div>
+
+              <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
+                <h2 className="mb-1 text-lg font-semibold text-white">
+                  Application
+                </h2>
+                <p className="mb-6 text-sm text-zinc-500">
+                  After you review the fit: say whether you applied, add the
+                  listing URL, then save. Recents in the sidebar list company and
+                  score; runs you mark “Yes” show an Applied badge so you can
+                  scan companies you applied to.
+                </p>
+                <div className="space-y-6">
+                  <div>
+                    <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+                      Applied for this job?
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setApplied(false)}
+                        className={`rounded-lg border px-4 py-2 text-sm font-medium transition ${
+                          !applied
+                            ? "border-zinc-500 bg-zinc-800 text-white"
+                            : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800"
+                        }`}
+                      >
+                        No
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setApplied(true)}
+                        className={`rounded-lg border px-4 py-2 text-sm font-medium transition ${
+                          applied
+                            ? "border-emerald-600/80 bg-emerald-950/50 text-emerald-200"
+                            : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800"
+                        }`}
+                      >
+                        Yes
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <label
+                      htmlFor="jobUrlResult"
+                      className="text-xs font-medium uppercase tracking-wide text-zinc-500"
+                    >
+                      Job posting URL
+                    </label>
+                    <input
+                      id="jobUrlResult"
+                      type="text"
+                      inputMode="url"
+                      value={jobUrl}
+                      onChange={(e) => setJobUrl(e.target.value)}
+                      placeholder="https://…"
+                      className="mt-2 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 outline-none focus:border-zinc-500 focus:ring-1 focus:ring-zinc-500"
+                    />
+                    {jobUrl.trim() && jobPostingHref(jobUrl) && (
+                      <a
+                        href={jobPostingHref(jobUrl)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="mt-2 inline-block text-sm text-blue-400 underline hover:text-blue-300"
+                      >
+                        Open posting
+                      </a>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={saveJobMeta}
+                    disabled={savingJobMeta || !activeEntryId}
+                    className="rounded-lg border border-zinc-600 bg-zinc-800 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {savingJobMeta ? "Saving…" : "Save application details"}
+                  </button>
+                </div>
+              </section>
             </div>
           )}
         </main>
