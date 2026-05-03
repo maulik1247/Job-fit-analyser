@@ -1,25 +1,34 @@
 import "dotenv/config";
+import { randomUUID } from "node:crypto";
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import { verifyToken } from "@clerk/backend";
+import multer from "multer";
 import {
   getDb,
   insertHistoryEntry,
   listHistoryForUser,
   deleteHistoryEntry,
   clearHistoryForUser,
+  listResumesForUser,
+  getResumeForUser,
+  insertResume,
+  updateResume,
+  deleteResume,
 } from "./db.js";
+import { extractResumeText } from "./resumeParse.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const SYSTEM_PROMPT =
-  "You are an expert recruiter and career coach. Analyse ONLY the job description provided (no candidate profile). Return ONLY a valid JSON object with exactly these keys:\n" +
-  "- matchScore: number 0-100 scoring overall JD quality and clarity as a hiring brief\n" +
-  "- keywordsMatched: array of strings — key skills, tools, and themes explicitly emphasized in the JD\n" +
-  "- keywordsMissing: array of strings — important skills, qualifications, or themes the JD omits or leaves vague\n" +
-  "- strengths: array of exactly 3 strings — strengths of how the role or JD is presented\n" +
-  "- gaps: array of exactly 3 strings — gaps or risks in the JD or role definition\n" +
+  "You are an expert recruiter and career coach. Compare the candidate RESUME to the JOB DESCRIPTION. Score how strong a fit the candidate is for this role (skills, experience, seniority, domain).\n" +
+  "Return ONLY a valid JSON object with exactly these keys:\n" +
+  "- matchScore: number 0-100 — how well the resume fits this specific JD (not abstract JD quality)\n" +
+  "- keywordsMatched: array of strings — important JD requirements, skills, or themes that the resume clearly supports or demonstrates\n" +
+  "- keywordsMissing: array of strings — important JD requirements that the resume does not show or only weakly suggests\n" +
+  "- strengths: array of exactly 3 strings — the candidate’s strongest points for this role based on the resume\n" +
+  "- gaps: array of exactly 3 strings — main gaps or risks (resume vs what the JD needs)\n" +
   "Return nothing else. No markdown, no code fences, no explanation. Pure JSON only.";
 
 const PORT = Number(process.env.PORT) || 8787;
@@ -33,7 +42,41 @@ if (!process.env.CLERK_SECRET_KEY?.trim()) {
 const app = express();
 if (isProd) app.set("trust proxy", 1);
 
-app.use(express.json({ limit: "512kb" }));
+/**
+ * Vercel + Vite: subpaths must hit `api/index.js`. `vercel.json` rewrites
+ * `/api/:path*` → `/api?__vp=:path*` so we restore the real path here before routing.
+ * Also handle runtimes that strip `/api` from `pathname` only (prefix fallback).
+ */
+if (process.env.VERCEL) {
+  app.use((req, _res, next) => {
+    try {
+      const raw = req.url || "/";
+      const u = new URL(raw, "http://vercel.internal");
+      const vp = u.searchParams.get("__vp");
+      if (vp !== null) {
+        u.searchParams.delete("__vp");
+        const tail = String(vp).replace(/^\/+|\/+$/g, "");
+        u.pathname = tail ? `/api/${tail}` : "/api";
+        const qs = u.searchParams.toString();
+        const fixed = u.pathname + (qs ? `?${qs}` : "");
+        req.url = fixed;
+        req.originalUrl = fixed;
+      } else if (!u.pathname.startsWith("/api")) {
+        const fixed =
+          "/api" +
+          (u.pathname === "/" ? "" : u.pathname) +
+          u.search;
+        req.url = fixed;
+        req.originalUrl = fixed;
+      }
+    } catch (e) {
+      console.error("vercel path:", e);
+    }
+    next();
+  });
+}
+
+app.use(express.json({ limit: "2mb" }));
 
 /**
  * Bearer JWT only — matches the SPA (`Authorization: Bearer` from Clerk `getToken()`).
@@ -80,6 +123,73 @@ const PLACEHOLDER_KEYS = new Set([
   "REPLACE_ME",
 ]);
 
+const uploadResume = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter(_req, file, cb) {
+    const n = (file.originalname || "").toLowerCase();
+    const ok =
+      n.endsWith(".pdf") || n.endsWith(".docx") || n.endsWith(".txt");
+    if (!ok) {
+      return cb(
+        new Error("Only PDF, DOCX, or TXT files are allowed.")
+      );
+    }
+    cb(null, true);
+  },
+});
+
+app.post(
+  "/api/resume/parse",
+  requireClerkAuth,
+  (req, res, next) => {
+    uploadResume.single("resume")(req, res, (err) => {
+      if (err) {
+        if (err.code === "LIMIT_FILE_SIZE") {
+          return res
+            .status(400)
+            .json({ error: "File too large (max 8 MB)." });
+        }
+        if (err.message) {
+          return res.status(400).json({ error: err.message });
+        }
+        return next(err);
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    try {
+      if (!req.file?.buffer) {
+        return res.status(400).json({
+          error: "No file uploaded. Use PDF, DOCX, or TXT.",
+        });
+      }
+      const text = await extractResumeText(
+        req.file.originalname,
+        req.file.mimetype,
+        req.file.buffer
+      );
+      const trimmed = text.replace(/\0/g, "").trim();
+      if (!trimmed) {
+        return res.status(422).json({
+          error:
+            "No readable text in this file. Try another export, or use a text-based PDF/DOCX. Scanned PDFs need OCR.",
+        });
+      }
+      res.json({
+        text: trimmed,
+        filename: req.file.originalname,
+      });
+    } catch (e) {
+      console.error(e);
+      res.status(400).json({
+        error: e?.message || "Could not read file",
+      });
+    }
+  }
+);
+
 app.get("/api/history", requireClerkAuth, (req, res) => {
   try {
     getDb();
@@ -102,6 +212,9 @@ app.post("/api/history", requireClerkAuth, (req, res) => {
   const jdText = body.jdText;
   const result = body.result;
   const createdAt = body.createdAt;
+  const resumeId = body.resumeId;
+  const resumeTitle = body.resumeTitle;
+  const resumeBody = body.resumeBody;
   if (
     typeof id !== "string" ||
     typeof companyName !== "string" ||
@@ -112,6 +225,15 @@ app.post("/api/history", requireClerkAuth, (req, res) => {
   ) {
     return res.status(400).json({ error: "Invalid history entry" });
   }
+  if (resumeId != null && typeof resumeId !== "string") {
+    return res.status(400).json({ error: "Invalid history entry" });
+  }
+  if (resumeTitle != null && typeof resumeTitle !== "string") {
+    return res.status(400).json({ error: "Invalid history entry" });
+  }
+  if (resumeBody != null && typeof resumeBody !== "string") {
+    return res.status(400).json({ error: "Invalid history entry" });
+  }
   try {
     getDb();
     insertHistoryEntry(req.clerkUserId, {
@@ -120,6 +242,9 @@ app.post("/api/history", requireClerkAuth, (req, res) => {
       jdText,
       result,
       createdAt,
+      resumeId: resumeId ?? null,
+      resumeTitle: resumeTitle ?? null,
+      resumeBody: resumeBody ?? null,
     });
     res.status(201).json({ ok: true });
   } catch (e) {
@@ -154,6 +279,99 @@ app.delete("/api/history/:id", requireClerkAuth, (req, res) => {
   }
 });
 
+app.get("/api/resumes", requireClerkAuth, (req, res) => {
+  try {
+    getDb();
+    const resumes = listResumesForUser(req.clerkUserId);
+    res.json({ resumes });
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({
+      error: "Could not load resumes (database unavailable).",
+      code: "DB_UNAVAILABLE",
+    });
+  }
+});
+
+app.post("/api/resumes", requireClerkAuth, (req, res) => {
+  const body = req.body ?? {};
+  const title = typeof body.title === "string" ? body.title.trim() : "";
+  const bodyText = typeof body.body === "string" ? body.body : "";
+  if (!title || !bodyText.trim()) {
+    return res.status(400).json({ error: "title and body are required" });
+  }
+  const id = typeof body.id === "string" ? body.id : randomUUID();
+  const now = new Date().toISOString();
+  try {
+    getDb();
+    insertResume(req.clerkUserId, {
+      id,
+      title,
+      body: bodyText,
+      createdAt: now,
+      updatedAt: now,
+    });
+    res.status(201).json({ id, title, body: bodyText, createdAt: now, updatedAt: now });
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({
+      error: "Could not save resume (database unavailable).",
+      code: "DB_UNAVAILABLE",
+    });
+  }
+});
+
+app.patch("/api/resumes/:id", requireClerkAuth, (req, res) => {
+  const body = req.body ?? {};
+  const title =
+    typeof body.title === "string" ? body.title.trim() : undefined;
+  const bodyText = typeof body.body === "string" ? body.body : undefined;
+  if (title === undefined && bodyText === undefined) {
+    return res.status(400).json({ error: "Provide title and/or body" });
+  }
+  try {
+    getDb();
+    const existing = getResumeForUser(req.clerkUserId, req.params.id);
+    if (!existing) return res.status(404).json({ error: "Not found" });
+    const nextTitle = title ?? existing.title;
+    const nextBody = bodyText ?? existing.body;
+    const updatedAt = new Date().toISOString();
+    updateResume(req.clerkUserId, req.params.id, {
+      title: nextTitle,
+      body: nextBody,
+      updatedAt,
+    });
+    res.json({
+      id: req.params.id,
+      title: nextTitle,
+      body: nextBody,
+      createdAt: existing.createdAt,
+      updatedAt,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({
+      error: "Could not update resume (database unavailable).",
+      code: "DB_UNAVAILABLE",
+    });
+  }
+});
+
+app.delete("/api/resumes/:id", requireClerkAuth, (req, res) => {
+  try {
+    getDb();
+    const ok = deleteResume(req.clerkUserId, req.params.id);
+    if (!ok) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(503).json({
+      error: "Could not delete resume (database unavailable).",
+      code: "DB_UNAVAILABLE",
+    });
+  }
+});
+
 app.post("/api/analyse", requireClerkAuth, async (req, res) => {
   const key = process.env.OPENAI_API_KEY?.trim();
   if (!key || PLACEHOLDER_KEYS.has(key)) {
@@ -167,9 +385,12 @@ app.post("/api/analyse", requireClerkAuth, async (req, res) => {
     });
   }
 
-  const { jdText } = req.body ?? {};
+  const { jdText, resumeText } = req.body ?? {};
   if (typeof jdText !== "string" || !jdText.trim()) {
     return res.status(400).json({ error: "jdText is required" });
+  }
+  if (typeof resumeText !== "string" || !resumeText.trim()) {
+    return res.status(400).json({ error: "resumeText is required" });
   }
 
   try {
@@ -181,10 +402,14 @@ app.post("/api/analyse", requireClerkAuth, async (req, res) => {
       },
       body: JSON.stringify({
         model: "gpt-4o",
-        max_tokens: 1500,
+        max_tokens: 2000,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: `Job Description:\n${jdText}` },
+          {
+            role: "user",
+            content:
+              `Candidate resume:\n${resumeText.trim()}\n\n---\n\nJob description:\n${jdText.trim()}`,
+          },
         ],
       }),
     });

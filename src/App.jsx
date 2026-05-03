@@ -1,4 +1,9 @@
-import { useState, useEffect, useCallback } from "react";
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+} from "react";
 import {
   SignedIn,
   SignedOut,
@@ -7,11 +12,24 @@ import {
   useAuth,
   useUser,
 } from "@clerk/clerk-react";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./components/ui/select.jsx";
+
+const RESUME_SELECT_NONE = "__shadcn_resume_none__";
 
 const GENERIC_ERROR =
   "Something went wrong. Please try again.";
 
-const VALIDATION_MESSAGE = "Please paste a job description before analysing.";
+const VALIDATION_JD = "Please paste a job description.";
+const VALIDATION_RESUME =
+  "Select a saved resume. Add one under My resumes in the sidebar if needed.";
+const VALIDATION_NO_RESUMES =
+  "Add at least one resume from the sidebar: My resumes → + Add.";
 
 function Spinner() {
   return (
@@ -51,6 +69,17 @@ function JDAnalyserApp() {
 
   const [companyName, setCompanyName] = useState("");
   const [jdText, setJdText] = useState("");
+  const [resumeText, setResumeText] = useState("");
+  const [resumes, setResumes] = useState([]);
+  const [selectedResumeId, setSelectedResumeId] = useState(null);
+  const [resumeModalOpen, setResumeModalOpen] = useState(false);
+  const [newResumeTitle, setNewResumeTitle] = useState("");
+  const [modalResumeFile, setModalResumeFile] = useState(null);
+  const [modalDragActive, setModalDragActive] = useState(false);
+  const [savingResume, setSavingResume] = useState(false);
+  const [modalError, setModalError] = useState(null);
+  const modalFileInputRef = useRef(null);
+  const modalDragDepthRef = useRef(0);
   const [result, setResult] = useState(null);
   const [history, setHistory] = useState([]);
   const [activeEntryId, setActiveEntryId] = useState(null);
@@ -59,7 +88,15 @@ function JDAnalyserApp() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [highlightJd, setHighlightJd] = useState(false);
+  const [highlightResume, setHighlightResume] = useState(false);
   const [validationMessage, setValidationMessage] = useState(null);
+
+  const loadResumes = useCallback(async () => {
+    const r = await apiFetch("/api/resumes");
+    if (!r.ok) return;
+    const data = await r.json();
+    setResumes(Array.isArray(data.resumes) ? data.resumes : []);
+  }, [apiFetch]);
 
   const loadHistory = useCallback(async () => {
     const r = await apiFetch("/api/history");
@@ -70,27 +107,105 @@ function JDAnalyserApp() {
 
   useEffect(() => {
     loadHistory().catch(console.error);
-  }, [loadHistory]);
+    loadResumes().catch(console.error);
+  }, [loadHistory, loadResumes]);
+
+  const closeResumeModal = useCallback(() => {
+    setResumeModalOpen(false);
+    setModalResumeFile(null);
+    setModalDragActive(false);
+    setNewResumeTitle("");
+    setModalError(null);
+    modalDragDepthRef.current = 0;
+    if (modalFileInputRef.current) modalFileInputRef.current.value = "";
+  }, []);
+
+  function isAllowedResumeFile(file) {
+    const n = (file?.name || "").toLowerCase();
+    return n.endsWith(".pdf") || n.endsWith(".docx") || n.endsWith(".txt");
+  }
+
+  function stageModalFile(file) {
+    if (!file || !isAllowedResumeFile(file)) {
+      setModalError("Please use a PDF, DOCX, or TXT file.");
+      return;
+    }
+    setModalError(null);
+    setModalResumeFile(file);
+  }
+
+  useEffect(() => {
+    if (!resumeModalOpen) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") closeResumeModal();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [resumeModalOpen, closeResumeModal]);
+
+  const parseResumeFile = async (file) => {
+    const fd = new FormData();
+    fd.append("resume", file);
+    const r = await apiFetch("/api/resume/parse", { method: "POST", body: fd });
+    const raw = await r.text();
+    let data = {};
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      throw new Error(
+        r.ok
+          ? "Invalid response from server."
+          : raw.trim().slice(0, 240) || `Request failed (${r.status}).`
+      );
+    }
+    if (!r.ok) {
+      const fallback =
+        raw.trim().slice(0, 240) || `Could not read file (${r.status})`;
+      throw new Error(
+        typeof data.error === "string" ? data.error : fallback
+      );
+    }
+    return {
+      text: data.text,
+      filename: data.filename || file.name,
+    };
+  };
 
   const startNewAnalysis = () => {
     setCompanyName("");
     setJdText("");
+    setResumeText("");
+    setSelectedResumeId(null);
     setResult(null);
     setError(null);
     setValidationMessage(null);
     setHighlightJd(false);
+    setHighlightResume(false);
     setActiveEntryId(null);
     setSidebarOpen(false);
   };
 
   const handleAnalyse = async () => {
     const jdOk = jdText.trim().length > 0;
+    const picked = resumes.find((r) => r.id === selectedResumeId);
+    const resumeBody = picked?.body?.trim() ?? "";
+    const resumeOk = Boolean(picked && resumeBody);
     setHighlightJd(!jdOk);
+    setHighlightResume(!resumeOk);
     setValidationMessage(null);
     setError(null);
 
     if (!jdOk) {
-      setValidationMessage(VALIDATION_MESSAGE);
+      setValidationMessage(VALIDATION_JD);
+      return;
+    }
+    if (resumes.length === 0) {
+      setValidationMessage(VALIDATION_NO_RESUMES);
+      setHighlightResume(true);
+      return;
+    }
+    if (!resumeOk) {
+      setValidationMessage(VALIDATION_RESUME);
       return;
     }
 
@@ -102,7 +217,10 @@ function JDAnalyserApp() {
       try {
         res = await apiFetch("/api/analyse", {
           method: "POST",
-          body: JSON.stringify({ jdText }),
+          body: JSON.stringify({
+            jdText,
+            resumeText: resumeBody,
+          }),
         });
       } catch (networkErr) {
         console.error(networkErr);
@@ -180,12 +298,17 @@ function JDAnalyserApp() {
 
       setResult(parsed);
 
+      const resumeTitleForHistory = picked?.title ?? "Resume";
+
       const entry = {
         id: crypto.randomUUID(),
         companyName: companyName.trim() || "Untitled company",
         jdText,
         result: parsed,
         createdAt: new Date().toISOString(),
+        resumeId: selectedResumeId ?? null,
+        resumeTitle: resumeTitleForHistory,
+        resumeBody: resumeBody,
       };
       setActiveEntryId(entry.id);
       const saveRes = await apiFetch("/api/history", {
@@ -206,12 +329,73 @@ function JDAnalyserApp() {
   const openHistoryEntry = (entry) => {
     setCompanyName(entry.companyName === "Untitled company" ? "" : entry.companyName);
     setJdText(entry.jdText);
+    setResumeText(entry.resumeBody ?? "");
+    setSelectedResumeId(
+      entry.resumeId != null &&
+        resumes.some((r) => r.id === entry.resumeId)
+        ? entry.resumeId
+        : null
+    );
     setResult(entry.result);
     setActiveEntryId(entry.id);
     setError(null);
     setValidationMessage(null);
     setHighlightJd(false);
+    setHighlightResume(false);
     setSidebarOpen(false);
+  };
+
+  const saveNewResume = async () => {
+    const file = modalResumeFile;
+    if (!file) return;
+    const explicit = newResumeTitle.trim();
+    const title =
+      explicit ||
+      file.name.replace(/\.[^.]+$/i, "").trim() ||
+      file.name;
+    setSavingResume(true);
+    setModalError(null);
+    try {
+      const { text } = await parseResumeFile(file);
+      const r = await apiFetch("/api/resumes", {
+        method: "POST",
+        body: JSON.stringify({ title, body: text }),
+      });
+      if (!r.ok) {
+        const errData = await r.json().catch(() => ({}));
+        setModalError(
+          typeof errData.error === "string"
+            ? errData.error
+            : "Could not save resume."
+        );
+        return;
+      }
+      const row = await r.json();
+      await loadResumes();
+      setSelectedResumeId(row.id);
+      setResumeText(row.body);
+      closeResumeModal();
+    } catch (e) {
+      console.error(e);
+      setModalError(e?.message || GENERIC_ERROR);
+    } finally {
+      setSavingResume(false);
+    }
+  };
+
+  const deleteResumeById = async (id) => {
+    try {
+      const r = await apiFetch(`/api/resumes/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      if (!r.ok) return;
+      await loadResumes();
+      if (selectedResumeId === id) {
+        setSelectedResumeId(null);
+      }
+    } catch (e) {
+      console.error(e);
+    }
   };
 
   const deleteHistoryEntry = async (id) => {
@@ -248,6 +432,15 @@ function JDAnalyserApp() {
           ? "bg-amber-600/25 border-amber-500/50"
           : "bg-red-600/25 border-red-500/50"
       : "";
+
+  const historyEntryForView = activeEntryId
+    ? history.find((h) => h.id === activeEntryId)
+    : null;
+  const resumeLabelForView =
+    (selectedResumeId &&
+      resumes.find((r) => r.id === selectedResumeId)?.title) ||
+    historyEntryForView?.resumeTitle ||
+    (resumeText.trim() ? "Resume" : "—");
 
   return (
     <div className="flex h-[100dvh] overflow-hidden bg-zinc-950 text-zinc-100">
@@ -356,6 +549,65 @@ function JDAnalyserApp() {
             </button>
           </div>
 
+          <div className="shrink-0 border-b border-zinc-800 px-3 pb-3 pt-1">
+            <div className="flex items-center justify-between gap-2 px-1 pt-2">
+              <p className="text-xs font-medium text-zinc-500">My resumes</p>
+              <button
+                type="button"
+                onClick={() => {
+                  setModalError(null);
+                  setResumeModalOpen(true);
+                  setModalResumeFile(null);
+                  setNewResumeTitle("");
+                  setModalDragActive(false);
+                  modalDragDepthRef.current = 0;
+                  if (modalFileInputRef.current) {
+                    modalFileInputRef.current.value = "";
+                  }
+                }}
+                className="text-xs font-medium text-zinc-400 hover:text-zinc-200"
+              >
+                + Add
+              </button>
+            </div>
+            <ul className="mt-2 max-h-40 space-y-0.5 overflow-y-auto">
+              {resumes.length === 0 ? (
+                <li className="px-2 py-2 text-xs text-zinc-500">
+                  No saved resumes. Click Add or upload on the main screen.
+                </li>
+              ) : (
+                resumes.map((r) => (
+                  <li
+                    key={r.id}
+                    className="group flex items-start gap-1 rounded-lg px-2 py-1.5 hover:bg-zinc-800/70"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedResumeId(r.id);
+                        setResumeText(r.body);
+                        setResumeUploadName(null);
+                        setSidebarOpen(false);
+                      }}
+                      className="min-w-0 flex-1 truncate text-left text-xs text-zinc-300"
+                      title={r.title}
+                    >
+                      {r.title}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteResumeById(r.id)}
+                      className="shrink-0 text-zinc-500 hover:text-red-400"
+                      aria-label={`Delete ${r.title}`}
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))
+              )}
+            </ul>
+          </div>
+
           <div className="shrink-0 px-4 pb-1 pt-3">
             <p className="text-xs font-medium text-zinc-500">Recents</p>
           </div>
@@ -387,7 +639,10 @@ function JDAnalyserApp() {
                           <span className="block truncate font-medium">
                             {entry.companyName}
                           </span>
-                          <span className="mt-0.5 block text-xs tabular-nums text-zinc-500">
+                          <span className="mt-0.5 block truncate text-xs text-zinc-500">
+                            {entry.resumeTitle
+                              ? `${entry.resumeTitle} · `
+                              : ""}
                             {score}/100
                           </span>
                         </span>
@@ -503,6 +758,75 @@ function JDAnalyserApp() {
                 </p>
               </div>
 
+              <div className="mb-6 flex flex-col gap-2">
+                <label
+                  htmlFor="resumePick"
+                  className="text-sm font-medium text-zinc-400"
+                >
+                  Resume
+                </label>
+                <Select
+                  value={selectedResumeId ?? RESUME_SELECT_NONE}
+                  onValueChange={(val) => {
+                    if (val === RESUME_SELECT_NONE) {
+                      setSelectedResumeId(null);
+                      setResumeText("");
+                      return;
+                    }
+                    const r = resumes.find((x) => x.id === val);
+                    setSelectedResumeId(val);
+                    setResumeText(r?.body ?? "");
+                    setHighlightResume(false);
+                    setValidationMessage(null);
+                  }}
+                >
+                  <SelectTrigger
+                    id="resumePick"
+                    className={
+                      highlightResume
+                        ? "border-red-500 focus:ring-red-500"
+                        : undefined
+                    }
+                    aria-invalid={highlightResume || undefined}
+                  >
+                    <SelectValue
+                      placeholder={
+                        resumes.length
+                          ? "Choose a saved resume…"
+                          : "No resumes yet — add one in the sidebar"
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent position="popper" sideOffset={4}>
+                    <SelectItem value={RESUME_SELECT_NONE}>
+                      {resumes.length
+                        ? "Choose a saved resume…"
+                        : "No resumes yet — add one in the sidebar"}
+                    </SelectItem>
+                    {resumes.map((r) => (
+                      <SelectItem key={r.id} value={r.id}>
+                        {r.title}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-zinc-500">
+                  Upload PDF, DOCX, or TXT under{" "}
+                  <span className="text-zinc-400">My resumes → + Add</span>.
+                  Then pick it here to compare with the job description.
+                </p>
+                {selectedResumeId &&
+                  resumeText.trim() &&
+                  resumes.some((x) => x.id === selectedResumeId) && (
+                    <p className="text-xs text-emerald-400/90">
+                      {
+                        resumes.find((x) => x.id === selectedResumeId)?.title
+                      }{" "}
+                      · {resumeText.length.toLocaleString()} characters
+                    </p>
+                  )}
+              </div>
+
               <div className="flex flex-col gap-2">
                 <label
                   htmlFor="jd"
@@ -540,10 +864,10 @@ function JDAnalyserApp() {
                 {loading ? (
                   <>
                     <Spinner />
-                    Analysing the role...
+                    Comparing resume to job…
                   </>
                 ) : (
-                  "Analyse"
+                  "Analyse fit"
                 )}
               </button>
             </>
@@ -559,7 +883,7 @@ function JDAnalyserApp() {
             <div className="mt-4 space-y-8 md:mt-2">
               <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
                 <h2 className="mb-4 text-lg font-semibold text-white">
-                  Analysed role
+                  Compared run
                 </h2>
                 <div className="space-y-4">
                   <div>
@@ -569,6 +893,17 @@ function JDAnalyserApp() {
                     <p className="mt-1.5 text-base font-medium text-zinc-100">
                       {companyName.trim() || "Untitled company"}
                     </p>
+                  </div>
+                  <div>
+                    <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+                      Resume used
+                    </p>
+                    <p className="mt-1 text-sm text-zinc-400">
+                      {resumeLabelForView}
+                    </p>
+                    <div className="mt-2 max-h-48 w-full overflow-y-auto rounded-lg border border-zinc-700/80 bg-zinc-950/60 px-3 py-3 text-xs leading-relaxed text-zinc-400 whitespace-pre-wrap">
+                      {resumeText || "(No resume text saved with this run)"}
+                    </div>
                   </div>
                   <div>
                     <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">
@@ -583,13 +918,13 @@ function JDAnalyserApp() {
 
               <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
                 <h2 className="mb-4 text-lg font-semibold text-white">
-                  JD Quality Score
+                  Resume ↔ job fit
                 </h2>
                 <div
                   className={`mx-auto flex max-w-xs flex-col items-center justify-center rounded-2xl border px-8 py-10 ${scoreBg}`}
                 >
                   <p className="mb-2 text-sm font-medium text-zinc-400">
-                    JD Quality Score
+                    Fit score
                   </p>
                   <p className="flex items-baseline justify-center gap-0 tabular-nums text-white">
                     <span className="text-6xl font-bold">
@@ -604,7 +939,7 @@ function JDAnalyserApp() {
 
               <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
                 <h2 className="mb-4 text-lg font-semibold text-white">
-                  Keywords Matched
+                  JD asks · resume supports
                 </h2>
                 <div className="flex flex-wrap gap-2">
                   {(result.keywordsMatched || []).map((kw) => (
@@ -620,7 +955,7 @@ function JDAnalyserApp() {
 
               <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
                 <h2 className="mb-4 text-lg font-semibold text-white">
-                  Keywords Missing
+                  JD asks · resume gaps
                 </h2>
                 <div className="flex flex-wrap gap-2">
                   {(result.keywordsMissing || []).map((kw) => (
@@ -637,7 +972,7 @@ function JDAnalyserApp() {
               <div className="grid grid-cols-1 gap-8 md:grid-cols-2">
                 <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
                   <h2 className="mb-4 text-lg font-semibold text-white">
-                    Strengths
+                    Your strengths for this role
                   </h2>
                   <ul className="list-disc space-y-2 pl-5 text-zinc-300">
                     {(result.strengths || []).map((s, i) => (
@@ -648,7 +983,7 @@ function JDAnalyserApp() {
 
                 <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
                   <h2 className="mb-4 text-lg font-semibold text-white">
-                    Gaps
+                    Gaps vs this JD
                   </h2>
                   <ul className="list-disc space-y-2 pl-5 text-zinc-300">
                     {(result.gaps || []).map((g, i) => (
@@ -661,6 +996,153 @@ function JDAnalyserApp() {
           )}
         </main>
       </div>
+
+      {resumeModalOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+          <button
+            type="button"
+            className="absolute inset-0 bg-black/70"
+            aria-label="Close dialog"
+            onClick={closeResumeModal}
+          />
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="resume-modal-title"
+            className="relative z-10 w-full max-w-md rounded-xl border border-zinc-600 bg-zinc-900 p-6 shadow-2xl"
+          >
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <h2
+                id="resume-modal-title"
+                className="text-lg font-semibold tracking-tight text-white"
+              >
+                Add resume
+              </h2>
+              <button
+                type="button"
+                onClick={closeResumeModal}
+                className="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-white"
+                aria-label="Close"
+              >
+                ×
+              </button>
+            </div>
+
+            <label
+              htmlFor="resume-modal-label"
+              className="text-xs font-medium text-zinc-500"
+            >
+              Label{" "}
+              <span className="font-normal text-zinc-600">(optional)</span>
+            </label>
+            <input
+              id="resume-modal-label"
+              type="text"
+              value={newResumeTitle}
+              onChange={(e) => setNewResumeTitle(e.target.value)}
+              placeholder="Defaults to file name"
+              className="mt-1.5 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 outline-none focus:border-zinc-500 focus:ring-1 focus:ring-zinc-500"
+            />
+
+            <input
+              ref={modalFileInputRef}
+              type="file"
+              accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+              className="hidden"
+              id="modal-resume-file"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) stageModalFile(f);
+              }}
+            />
+
+            <div
+              onDragEnter={(e) => {
+                e.preventDefault();
+                modalDragDepthRef.current += 1;
+                setModalDragActive(true);
+              }}
+              onDragLeave={(e) => {
+                e.preventDefault();
+                modalDragDepthRef.current -= 1;
+                if (modalDragDepthRef.current <= 0) {
+                  modalDragDepthRef.current = 0;
+                  setModalDragActive(false);
+                }
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                modalDragDepthRef.current = 0;
+                setModalDragActive(false);
+                const f = e.dataTransfer.files?.[0];
+                if (f) stageModalFile(f);
+              }}
+              className={`mt-4 rounded-xl border-2 border-dashed px-4 py-10 text-center transition ${
+                modalDragActive
+                  ? "border-zinc-400 bg-zinc-800/70"
+                  : "border-zinc-600 bg-zinc-950/60"
+              }`}
+            >
+              <p className="text-sm font-medium text-zinc-200">
+                {modalResumeFile
+                  ? modalResumeFile.name
+                  : "Drag and drop your resume here"}
+              </p>
+              <p className="mt-2 text-xs text-zinc-500">
+                PDF, DOCX, or TXT · max 8 MB
+              </p>
+              <button
+                type="button"
+                onClick={() => modalFileInputRef.current?.click()}
+                className="mt-4 text-xs font-medium text-zinc-400 underline decoration-zinc-600 underline-offset-2 hover:text-zinc-200"
+              >
+                Browse files
+              </button>
+              {modalResumeFile && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setModalResumeFile(null);
+                    if (modalFileInputRef.current) {
+                      modalFileInputRef.current.value = "";
+                    }
+                  }}
+                  className="mt-4 block w-full text-xs text-red-400/90 hover:text-red-300"
+                >
+                  Remove file
+                </button>
+              )}
+            </div>
+
+            {modalError && (
+              <p className="mt-4 text-sm text-red-400" role="alert">
+                {modalError}
+              </p>
+            )}
+
+            <div className="mt-6 flex justify-end gap-2 border-t border-zinc-800 pt-4">
+              <button
+                type="button"
+                onClick={closeResumeModal}
+                className="rounded-lg px-4 py-2 text-sm text-zinc-400 hover:bg-zinc-800 hover:text-white"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={savingResume || !modalResumeFile}
+                onClick={() => saveNewResume()}
+                className="rounded-lg bg-white px-4 py-2 text-sm font-semibold text-zinc-900 hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {savingResume ? "Saving…" : "Save resume"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -685,7 +1167,7 @@ export default function App() {
             JD Analyser
           </h1>
           <p className="mb-6 max-w-sm text-center text-sm text-zinc-500">
-            Sign in to run analyses. History is saved per account.
+            Sign in to compare your resume to job descriptions. History and saved resumes are stored per account.
           </p>
           <div className="w-full max-w-md">
             <SignIn routing="hash" appearance={{ baseTheme: "light" }} />

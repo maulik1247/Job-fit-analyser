@@ -21,6 +21,11 @@ const dbPath =
 
 let db;
 
+function columnExists(database, table, name) {
+  const cols = database.prepare(`PRAGMA table_info(${table})`).all();
+  return cols.some((c) => c.name === name);
+}
+
 function migrateIfNeeded(database) {
   const row = database
     .prepare(
@@ -34,6 +39,18 @@ function migrateIfNeeded(database) {
     database.exec(
       "DROP TABLE IF EXISTS history_entries; DROP TABLE IF EXISTS users;"
     );
+  }
+}
+
+function migrateHistoryResumeColumns(database) {
+  if (!columnExists(database, "history_entries", "resume_id")) {
+    database.exec("ALTER TABLE history_entries ADD COLUMN resume_id TEXT");
+  }
+  if (!columnExists(database, "history_entries", "resume_title")) {
+    database.exec("ALTER TABLE history_entries ADD COLUMN resume_title TEXT");
+  }
+  if (!columnExists(database, "history_entries", "resume_body")) {
+    database.exec("ALTER TABLE history_entries ADD COLUMN resume_body TEXT");
   }
 }
 
@@ -55,6 +72,18 @@ export function getDb() {
       );
       CREATE INDEX IF NOT EXISTS idx_history_clerk ON history_entries(clerk_user_id, created_at DESC);
     `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS resumes (
+        id TEXT PRIMARY KEY,
+        clerk_user_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_resumes_clerk ON resumes(clerk_user_id, updated_at DESC);
+    `);
+    migrateHistoryResumeColumns(db);
   }
   return db;
 }
@@ -66,8 +95,8 @@ export function insertHistoryEntry(clerkUserId, entry) {
   const tx = database.transaction(() => {
     database
       .prepare(
-        `INSERT INTO history_entries (id, clerk_user_id, company_name, jd_text, result_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`
+        `INSERT INTO history_entries (id, clerk_user_id, company_name, jd_text, result_json, created_at, resume_id, resume_title, resume_body)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         entry.id,
@@ -75,7 +104,10 @@ export function insertHistoryEntry(clerkUserId, entry) {
         entry.companyName,
         entry.jdText,
         JSON.stringify(entry.result),
-        entry.createdAt
+        entry.createdAt,
+        entry.resumeId ?? null,
+        entry.resumeTitle ?? null,
+        entry.resumeBody ?? null
       );
     const count = database
       .prepare(
@@ -98,7 +130,8 @@ export function insertHistoryEntry(clerkUserId, entry) {
 export function listHistoryForUser(clerkUserId) {
   const rows = getDb()
     .prepare(
-      `SELECT id, company_name as companyName, jd_text as jdText, result_json as resultJson, created_at as createdAt
+      `SELECT id, company_name as companyName, jd_text as jdText, result_json as resultJson, created_at as createdAt,
+              resume_id as resumeId, resume_title as resumeTitle, resume_body as resumeBody
        FROM history_entries WHERE clerk_user_id = ? ORDER BY created_at DESC`
     )
     .all(clerkUserId);
@@ -108,7 +141,82 @@ export function listHistoryForUser(clerkUserId) {
     jdText: row.jdText,
     result: JSON.parse(row.resultJson),
     createdAt: row.createdAt,
+    resumeId: row.resumeId,
+    resumeTitle: row.resumeTitle,
+    resumeBody: row.resumeBody,
   }));
+}
+
+const MAX_RESUMES = 30;
+
+export function listResumesForUser(clerkUserId) {
+  return getDb()
+    .prepare(
+      `SELECT id, title, body, created_at as createdAt, updated_at as updatedAt
+       FROM resumes WHERE clerk_user_id = ? ORDER BY updated_at DESC`
+    )
+    .all(clerkUserId);
+}
+
+export function getResumeForUser(clerkUserId, id) {
+  const row = getDb()
+    .prepare(
+      `SELECT id, title, body, created_at as createdAt, updated_at as updatedAt
+       FROM resumes WHERE id = ? AND clerk_user_id = ?`
+    )
+    .get(id, clerkUserId);
+  return row ?? null;
+}
+
+export function insertResume(clerkUserId, { id, title, body, createdAt, updatedAt }) {
+  const database = getDb();
+  const n = database
+    .prepare("SELECT COUNT(*) as c FROM resumes WHERE clerk_user_id = ?")
+    .get(clerkUserId).c;
+  if (n >= MAX_RESUMES) {
+    const oldest = database
+      .prepare(
+        `SELECT id FROM resumes WHERE clerk_user_id = ? ORDER BY updated_at ASC LIMIT 1`
+      )
+      .get(clerkUserId);
+    if (oldest) {
+      database
+        .prepare("DELETE FROM resumes WHERE id = ? AND clerk_user_id = ?")
+        .run(oldest.id, clerkUserId);
+    }
+  }
+  database
+    .prepare(
+      `INSERT INTO resumes (id, clerk_user_id, title, body, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .run(id, clerkUserId, title, body, createdAt, updatedAt);
+}
+
+export function updateResume(
+  clerkUserId,
+  id,
+  { title, body, updatedAt }
+) {
+  const row = getDb()
+    .prepare(
+      "SELECT id FROM resumes WHERE id = ? AND clerk_user_id = ?"
+    )
+    .get(id, clerkUserId);
+  if (!row) return false;
+  getDb()
+    .prepare(
+      `UPDATE resumes SET title = ?, body = ?, updated_at = ? WHERE id = ? AND clerk_user_id = ?`
+    )
+    .run(title, body, updatedAt, id, clerkUserId);
+  return true;
+}
+
+export function deleteResume(clerkUserId, id) {
+  const info = getDb()
+    .prepare("DELETE FROM resumes WHERE id = ? AND clerk_user_id = ?")
+    .run(id, clerkUserId);
+  return info.changes > 0;
 }
 
 export function deleteHistoryEntry(clerkUserId, entryId) {
